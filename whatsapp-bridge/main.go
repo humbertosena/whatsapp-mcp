@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -693,6 +697,93 @@ func bridgeAddr() string {
 	return defaultBridgeAddr
 }
 
+const (
+	// storeDir holds the session database, the message database, the API token
+	// and downloaded media. It is relative to the working directory.
+	storeDir = "store"
+	// tokenFileName is the file inside storeDir that persists the generated API token.
+	tokenFileName = "bridge_token"
+	// minTokenLength is the shortest token accepted from WHATSAPP_BRIDGE_TOKEN.
+	minTokenLength = 16
+)
+
+// loadOrCreateToken returns the bearer token that protects the REST API.
+//
+// WHATSAPP_BRIDGE_TOKEN wins when set. Otherwise the token is read from
+// dir/bridge_token; if that file is missing or empty, a random 32-byte token
+// (hex encoded) is generated and saved there with mode 0600.
+func loadOrCreateToken(dir string) (string, error) {
+	if token := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_TOKEN")); token != "" {
+		if len(token) < minTokenLength {
+			return "", fmt.Errorf("WHATSAPP_BRIDGE_TOKEN must be at least %d characters long", minTokenLength)
+		}
+		return token, nil
+	}
+
+	path := filepath.Join(dir, tokenFileName)
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if token := strings.TrimSpace(string(data)); len(token) >= minTokenLength {
+			return token, nil
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return "", fmt.Errorf("failed to read API token file: %v", err)
+	}
+
+	raw := make([]byte, 32)
+	if _, err := cryptorand.Read(raw); err != nil {
+		return "", fmt.Errorf("failed to generate API token: %v", err)
+	}
+	token := hex.EncodeToString(raw)
+	if err := os.WriteFile(path, []byte(token+"\n"), 0600); err != nil {
+		return "", fmt.Errorf("failed to save API token: %v", err)
+	}
+	// WriteFile keeps the mode of a pre-existing file, so enforce it explicitly.
+	if err := os.Chmod(path, 0600); err != nil {
+		return "", fmt.Errorf("failed to restrict API token file: %v", err)
+	}
+	return token, nil
+}
+
+// checkAPIRequest decides whether a request may reach the API handlers. It
+// returns 0 when the request is allowed, or the HTTP status and message to
+// answer with.
+//
+// Browsers attach Origin (cross-origin POSTs) and Sec-Fetch-Site (always) to
+// requests; legitimate clients such as the Python MCP server send neither, so
+// their presence means a web page is driving the request (CSRF).
+func checkAPIRequest(r *http.Request, token string) (int, string) {
+	if _, ok := r.Header["Origin"]; ok {
+		return http.StatusForbidden, "Cross-origin requests are not allowed"
+	}
+	if site, ok := r.Header["Sec-Fetch-Site"]; ok && (len(site) != 1 || site[0] != "none") {
+		return http.StatusForbidden, "Browser-initiated requests are not allowed"
+	}
+
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	// An empty configured token must never authenticate anyone.
+	if token == "" || !ok || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+		return http.StatusUnauthorized, "Unauthorized"
+	}
+
+	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "application/json" {
+		return http.StatusUnsupportedMediaType, "Content-Type must be application/json"
+	}
+	return 0, ""
+}
+
+// apiGuard wraps next so every request must pass checkAPIRequest first.
+func apiGuard(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if status, msg := checkAPIRequest(r, token); status != 0 {
+			http.Error(w, msg, status)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // limitRequestBody wraps next so that request bodies larger than
 // maxRequestBodyBytes fail to be read.
 func limitRequestBody(next http.Handler) http.Handler {
@@ -713,7 +804,7 @@ func writeBodyError(w http.ResponseWriter, err error) {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr string) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr, token string) {
 	mux := http.NewServeMux()
 
 	// Handler for sending messages
@@ -815,7 +906,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr 
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           limitRequestBody(mux),
+		Handler:           limitRequestBody(apiGuard(token, mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		// Sending media uploads the file to WhatsApp before replying, so allow more time.
@@ -886,6 +977,13 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+
+	// Token that every REST API request must present
+	apiToken, err := loadOrCreateToken(storeDir)
+	if err != nil {
+		logger.Errorf("Failed to set up API token: %v", err)
+		return
+	}
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -959,7 +1057,8 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, bridgeAddr())
+	startRESTServer(client, messageStore, bridgeAddr(), apiToken)
+	fmt.Printf("REST API requires a bearer token (WHATSAPP_BRIDGE_TOKEN or %s)\n", filepath.Join(storeDir, tokenFileName))
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
