@@ -208,8 +208,77 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// defaultMediaDirName is the folder under the user's home that holds files
+// allowed to be sent when WHATSAPP_MEDIA_DIR is not set.
+const defaultMediaDirName = "whatsapp-mcp-media"
+
+// errMediaPathRejected is deliberately generic: telling "missing" apart from
+// "outside the media directory" would let a caller probe the filesystem.
+var errMediaPathRejected = errors.New("media_path must be a regular file inside the allowed media directory (WHATSAPP_MEDIA_DIR)")
+
+// setupMediaDir returns the only directory media files may be sent from:
+// WHATSAPP_MEDIA_DIR or ~/whatsapp-mcp-media. It is created with mode 0700 when
+// it does not exist.
+func setupMediaDir() (string, error) {
+	dir := strings.TrimSpace(os.Getenv("WHATSAPP_MEDIA_DIR"))
+	if dir == "" {
+		dir = "~/" + defaultMediaDirName
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to find home directory: %v", err)
+		}
+		dir = filepath.Join(home, dir[1:])
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create media directory: %v", err)
+	}
+	return dir, nil
+}
+
+// isWithinDir reports whether target is strictly inside base. Both must be
+// absolute (and, when symlinks matter, already resolved).
+func isWithinDir(base, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil || rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolveMediaPath validates a caller-supplied media path against allowedDir and
+// returns the fully resolved path to read. The path is made absolute and has its
+// symlinks resolved, so "..", symlinks that point outside and relative paths
+// cannot escape allowedDir. Directories and non-regular files are rejected.
+func resolveMediaPath(allowedDir, mediaPath string) (string, error) {
+	if mediaPath == "" {
+		return "", errMediaPathRejected
+	}
+	base, err := filepath.Abs(allowedDir)
+	if err != nil {
+		return "", errMediaPathRejected
+	}
+	if base, err = filepath.EvalSymlinks(base); err != nil {
+		return "", errMediaPathRejected
+	}
+	abs, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return "", errMediaPathRejected
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil || !isWithinDir(base, resolved) {
+		return "", errMediaPathRejected
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", errMediaPathRejected
+	}
+	return resolved, nil
+}
+
+// Function to send a WhatsApp message. Media files are only read from mediaDir.
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, mediaDir string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -239,14 +308,20 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
-		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
+		// Only files inside the allowed media directory may be sent
+		resolvedPath, err := resolveMediaPath(mediaDir, mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, err.Error()
+		}
+
+		// Read media file
+		mediaData, err := os.ReadFile(resolvedPath)
+		if err != nil {
+			return false, "Error reading media file"
 		}
 
 		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+		fileExt := strings.ToLower(strings.TrimPrefix(filepath.Ext(resolvedPath), "."))
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -352,7 +427,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(filepath.Base(resolvedPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -804,7 +879,7 @@ func writeBodyError(w http.ResponseWriter, err error) {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr, token string) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr, token, mediaDir string) {
 	mux := http.NewServeMux()
 
 	// Handler for sending messages
@@ -836,7 +911,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr,
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, mediaDir)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -985,6 +1060,13 @@ func main() {
 		return
 	}
 
+	// Directory that media files may be sent from
+	mediaDir, err := setupMediaDir()
+	if err != nil {
+		logger.Errorf("Failed to set up media directory: %v", err)
+		return
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -1057,8 +1139,9 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, bridgeAddr(), apiToken)
+	startRESTServer(client, messageStore, bridgeAddr(), apiToken, mediaDir)
 	fmt.Printf("REST API requires a bearer token (WHATSAPP_BRIDGE_TOKEN or %s)\n", filepath.Join(storeDir, tokenFileName))
+	fmt.Printf("Media files can only be sent from %s\n", mediaDir)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

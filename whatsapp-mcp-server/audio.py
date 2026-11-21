@@ -61,24 +61,30 @@ def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate
         raise RuntimeError(f"Failed to convert audio. You likely need to install ffmpeg {e.stderr}")
 
 
-def convert_to_opus_ogg_temp(input_file, bitrate="32k", sample_rate=24000):
+def convert_to_opus_ogg_temp(input_file, bitrate="32k", sample_rate=24000, temp_dir=None):
     """
     Convert an audio file to Opus format in an Ogg container and store in a temporary file.
-    
+
     Args:
         input_file (str): Path to the input audio file
         bitrate (str, optional): Target bitrate for Opus encoding (default: "32k")
         sample_rate (int, optional): Sample rate for output (default: 24000)
-    
+        temp_dir (str, optional): Directory for the temporary file. It is created with
+                                  mode 0700 if missing. Defaults to the system temp directory.
+
     Returns:
-        str: Path to the temporary file with the converted audio
-        
+        str: Path to the temporary file with the converted audio. The caller is
+             responsible for deleting it.
+
     Raises:
         FileNotFoundError: If the input file doesn't exist
         RuntimeError: If the ffmpeg conversion fails
     """
+    if temp_dir:
+        os.makedirs(temp_dir, mode=0o700, exist_ok=True)
+
     # Create a temporary file with .ogg extension
-    temp_file = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    temp_file = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False, dir=temp_dir)
     temp_file.close()
     
     try:

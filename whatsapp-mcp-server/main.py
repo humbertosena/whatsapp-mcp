@@ -186,11 +186,13 @@ def send_message(
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+    Only files inside the allowed media directory (WHATSAPP_MEDIA_DIR, default ~/whatsapp-mcp-media) can be sent; any other path is rejected.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
+        media_path: The absolute path to the media file to send (image, video, document).
+                 It must be inside WHATSAPP_MEDIA_DIR (default ~/whatsapp-mcp-media).
     
     Returns:
         A dictionary containing success status and a status message
@@ -206,11 +208,13 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+    Only files inside the allowed media directory (WHATSAPP_MEDIA_DIR, default ~/whatsapp-mcp-media) can be sent; any other path is rejected.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
+        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file).
+                 It must be inside WHATSAPP_MEDIA_DIR (default ~/whatsapp-mcp-media).
     
     Returns:
         A dictionary containing success status and a status message
