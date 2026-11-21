@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"math/rand"
 	"mime"
@@ -49,6 +50,82 @@ type Message struct {
 	Filename  string
 }
 
+// logContent re-enables logging of message content, names and identifiers.
+// By default only metadata (direction, media type, size) is logged.
+var logContent = os.Getenv("WHATSAPP_BRIDGE_LOG_CONTENT") == "1"
+
+// logDetailf prints a line only when WHATSAPP_BRIDGE_LOG_CONTENT=1.
+func logDetailf(format string, args ...interface{}) {
+	if logContent {
+		fmt.Printf(format+"\n", args...)
+	}
+}
+
+// messageLogLine describes a stored message for the logs. It carries metadata
+// only (direction, type, size); sender, file name and text are added when
+// WHATSAPP_BRIDGE_LOG_CONTENT=1. size is the media size, or the text length.
+func messageLogLine(isFromMe bool, sender, mediaType, filename, content string, mediaSize uint64) string {
+	direction := "in"
+	if isFromMe {
+		direction = "out"
+	}
+	kind, size := "text", uint64(len(content))
+	if mediaType != "" {
+		kind, size = mediaType, mediaSize
+	}
+
+	line := fmt.Sprintf("message %s type=%s size=%d", direction, kind, size)
+	if logContent {
+		line += fmt.Sprintf(" sender=%s filename=%q content=%q", sender, filename, content)
+	}
+	return line
+}
+
+// ensureStoreDir creates the store directory with mode 0700, tightening it if
+// it already exists with looser permissions.
+func ensureStoreDir() error {
+	if err := os.MkdirAll(storeDir, 0700); err != nil {
+		return fmt.Errorf("failed to create store directory: %v", err)
+	}
+	if err := os.Chmod(storeDir, 0700); err != nil {
+		return fmt.Errorf("failed to restrict store directory: %v", err)
+	}
+	return nil
+}
+
+// hardenStorePermissions makes everything under dir private to the current
+// user: directories 0700 and regular files 0600. That covers whatsapp.db (which
+// holds the session keys), messages.db, bridge_token and downloaded media.
+// Symlinks and special files are left alone.
+func hardenStorePermissions(dir string) error {
+	var errs []error
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil // e.g. a SQLite journal file that just went away
+			}
+			return err
+		}
+		var mode os.FileMode
+		switch {
+		case d.IsDir():
+			mode = 0700
+		case d.Type().IsRegular():
+			mode = 0600
+		default:
+			return nil
+		}
+		if err := os.Chmod(path, mode); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		errs = append(errs, walkErr)
+	}
+	return errors.Join(errs...)
+}
+
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
@@ -57,8 +134,8 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	if err := ensureStoreDir(); err != nil {
+		return nil, err
 	}
 
 	// Open SQLite database for messages
@@ -371,7 +448,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		// Never print resp: it carries the media encryption key and download URL
+		fmt.Printf("Media uploaded: type=%s size=%d\n", mediaType, len(mediaData))
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -599,19 +677,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
-
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+		// Log message reception (metadata only unless WHATSAPP_BRIDGE_LOG_CONTENT=1)
+		fmt.Println(messageLogLine(msg.Info.IsFromMe, sender, mediaType, filename, content, fileLength))
 	}
 }
 
@@ -757,7 +824,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	fmt.Printf("Attempting to download %s media (%d bytes)...\n", mediaType, fileLength)
+	logDetailf("Download target: message=%s chat=%s", messageID, chatJID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -798,7 +866,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, localPath, len(mediaData))
+	fmt.Printf("Successfully downloaded %s media (%d bytes)\n", mediaType, len(mediaData))
+	logDetailf("Saved media to %s", localPath)
 	return true, mediaType, filename, localPath, nil
 }
 
@@ -974,11 +1043,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr,
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Printf("Received send request: media=%t message_size=%d\n", req.MediaPath != "", len(req.Message))
+		logDetailf("Send request: recipient=%s message=%q media_path=%q", req.Recipient, req.Message, req.MediaPath)
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath, mediaDir)
-		fmt.Println("Message sent", success, message)
+		fmt.Printf("Send finished: success=%t\n", success)
+		logDetailf("Send result: %s", message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -1080,8 +1151,8 @@ func main() {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
+	if err := ensureStoreDir(); err != nil {
+		logger.Errorf("%v", err)
 		return
 	}
 
@@ -1124,6 +1195,11 @@ func main() {
 	if err != nil {
 		logger.Errorf("Failed to set up API token: %v", err)
 		return
+	}
+
+	// Databases, token and media now exist: make them private to this user
+	if err := hardenStorePermissions(storeDir); err != nil {
+		logger.Warnf("Could not restrict permissions on %s: %v", storeDir, err)
 	}
 
 	// Directory that media files may be sent from
@@ -1230,7 +1306,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+		if logContent {
+			logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+		}
 		return existingName
 	}
 
@@ -1239,7 +1317,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 	if jid.Server == "g.us" {
 		// This is a group chat
-		logger.Infof("Getting name for group: %s", chatJID)
+		if logContent {
+			logger.Infof("Getting name for group: %s", chatJID)
+		}
 
 		// Use conversation data if provided (from history sync)
 		if conversation != nil {
@@ -1283,10 +1363,14 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using group name: %s", name)
+		if logContent {
+			logger.Infof("Using group name: %s", name)
+		}
 	} else {
 		// This is an individual contact
-		logger.Infof("Getting name for contact: %s", chatJID)
+		if logContent {
+			logger.Infof("Getting name for contact: %s", chatJID)
+		}
 
 		// Just use contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(jid)
@@ -1300,7 +1384,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			name = jid.User
 		}
 
-		logger.Infof("Using contact name: %s", name)
+		if logContent {
+			logger.Infof("Using contact name: %s", name)
+		}
 	}
 
 	return name
@@ -1373,9 +1459,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
 					continue
@@ -1432,14 +1515,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
+					// Log successful message storage (metadata only unless WHATSAPP_BRIDGE_LOG_CONTENT=1)
+					logger.Infof("Stored %s", messageLogLine(isFromMe, sender, mediaType, filename, content, fileLength))
 				}
 			}
 		}
