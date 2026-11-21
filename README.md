@@ -106,6 +106,60 @@ Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
 
+## Security
+
+The bridge keeps a REST API on your machine and holds the keys to your WhatsApp account, so it is locked down by default:
+
+- The API listens on `127.0.0.1:8080` only, so other machines cannot reach it.
+- Every request needs a secret bearer token. Browser requests (CSRF) are rejected.
+- Files can only be sent from one dedicated folder.
+- Downloaded file names cannot escape `whatsapp-bridge/store/`.
+- `store/` is private to your user, and message text is not written to the logs.
+
+### Environment variables
+
+Set these for **both** the bridge and the MCP server when you change them (for the MCP server, use the `env` key of its entry in your MCP client config).
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `WHATSAPP_BRIDGE_ADDR` | `127.0.0.1:8080` | Address the bridge's REST API listens on. The MCP server connects to the same address. Only widen it (for example `0.0.0.0:8080`) if you understand that anything that reaches the port and knows the token can send messages as you. |
+| `WHATSAPP_BRIDGE_TOKEN` | generated | Bearer token required by the REST API. Must be at least 16 characters. When unset, a random token is created on first run and stored in `whatsapp-bridge/store/bridge_token`. |
+| `WHATSAPP_MEDIA_DIR` | `~/whatsapp-mcp-media` | The only folder `send_file` and `send_audio_message` can read from. Created with mode `0700` if missing. |
+| `WHATSAPP_BRIDGE_LOG_CONTENT` | unset | Set to `1` to log message text, sender, file names, recipients and paths while debugging. Without it the bridge logs only direction, media type and size. |
+
+### API token
+
+- By default the token is a random 32-byte hex string saved in `whatsapp-bridge/store/bridge_token` (mode `0600`) the first time the bridge starts. Later runs reuse it.
+- The MCP server reads the token from `WHATSAPP_BRIDGE_TOKEN`, or else from that file. You do not need to copy it anywhere. Start the bridge once before using the MCP server.
+- If you set `WHATSAPP_BRIDGE_TOKEN` yourself, give the same value to the bridge and to the MCP server.
+- To rotate the token, delete `whatsapp-bridge/store/bridge_token` and restart the bridge.
+- Calling the API by hand needs the token, a JSON content type, and no `Origin` header:
+
+  ```bash
+  curl -X POST http://127.0.0.1:8080/api/send \
+    -H "Authorization: Bearer $(cat whatsapp-bridge/store/bridge_token)" \
+    -H "Content-Type: application/json" \
+    -d '{"recipient": "123456789", "message": "hello"}'
+  ```
+
+### Sending files
+
+`send_file` and `send_audio_message` only accept files inside `WHATSAPP_MEDIA_DIR`. Copy the file there first. Symlinks are resolved before the check, so a link that points outside the folder is rejected, and so are directories. Audio that needs converting to Opus is converted in `WHATSAPP_MEDIA_DIR/.tmp/` and deleted right after sending.
+
+### Ask for human approval before sending
+
+Anything that reads your messages can be tricked by text inside those messages (prompt injection) into sending messages or files for you. Configure your MCP client to **ask you before running** these tools instead of auto-approving them:
+
+- `send_message`
+- `send_file`
+- `send_audio_message`
+
+For example, in Claude Code put them under `ask` in `permissions`: `mcp__whatsapp__send_message`, `mcp__whatsapp__send_file` and `mcp__whatsapp__send_audio_message` (the server is named `whatsapp` in the config above). In Claude Desktop, do not choose "Always allow" for them. In Cursor, keep auto-run off for MCP tools.
+
+### Protect your session data
+
+`whatsapp-bridge/store/whatsapp.db` contains your WhatsApp **session keys**. Whoever has a copy can use your WhatsApp account without scanning a QR code. Do not copy, share, commit, upload or back it up unencrypted. `messages.db` holds your whole message history and `bridge_token` unlocks the API, so treat them the same way. The bridge makes everything in `store/` readable only by your user, and `.gitignore` excludes the folder. If a copy of `whatsapp.db` ever leaks, remove the linked device in WhatsApp (Settings > Linked Devices) and delete the file.
+
 ## Architecture Overview
 
 This application consists of two main components:
@@ -137,8 +191,8 @@ Claude can access the following tools to interact with WhatsApp:
 - **get_last_interaction**: Get the most recent message with a contact
 - **get_message_context**: Retrieve context around a specific message
 - **send_message**: Send a WhatsApp message to a specified phone number or group JID
-- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
-- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
+- **send_file**: Send a file (image, video, raw audio, document) to a specified recipient. The file must be inside `WHATSAPP_MEDIA_DIR` (see [Security](#security))
+- **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed). The file must be inside `WHATSAPP_MEDIA_DIR`
 - **download_media**: Download media from a WhatsApp message and get the local file path
 
 ### Media Handling Features
@@ -149,7 +203,7 @@ The MCP server supports both sending and receiving various media types:
 
 You can send various media types to your WhatsApp contacts:
 
-- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type.
+- **Images, Videos, Documents**: Use the `send_file` tool to share any supported media type. Files must be inside `WHATSAPP_MEDIA_DIR` (default `~/whatsapp-mcp-media`).
 - **Voice Messages**: Use the `send_audio_message` tool to send audio files as playable WhatsApp voice messages.
   - For optimal compatibility, audio files should be in `.ogg` Opus format.
   - With FFmpeg installed, the system will automatically convert other audio formats (MP3, WAV, etc.) to the required format.
@@ -171,6 +225,9 @@ By default, just the metadata of the media is stored in the local database. The 
 
 - If you encounter permission issues when running uv, you may need to add it to your PATH or use the full path to the executable.
 - Make sure both the Go application and the Python server are running for the integration to work properly.
+- **"WhatsApp bridge token not found"**: start the bridge once so it creates `whatsapp-bridge/store/bridge_token`, or set `WHATSAPP_BRIDGE_TOKEN` for the MCP server.
+- **HTTP 401 from the bridge**: the MCP server and the bridge use different tokens. Remove `WHATSAPP_BRIDGE_TOKEN` from one of them or give both the same value.
+- **"Media files must be inside the allowed media directory"**: copy the file into `WHATSAPP_MEDIA_DIR` (default `~/whatsapp-mcp-media`) and use that path.
 
 ### Authentication Issues
 

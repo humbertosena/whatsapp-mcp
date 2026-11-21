@@ -1,3 +1,6 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Bridge data: session keys, API token, message history and downloaded media
+whatsapp-bridge/store/
