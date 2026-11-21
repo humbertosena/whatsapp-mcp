@@ -2,13 +2,25 @@ import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-import os.path
+import os
 import requests
 import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _api_base_url() -> str:
+    """Build the bridge API URL, following WHATSAPP_BRIDGE_ADDR like the bridge does."""
+    addr = os.environ.get("WHATSAPP_BRIDGE_ADDR", "").strip() or "127.0.0.1:8080"
+    host, _, port = addr.rpartition(":")
+    # A wildcard listen address (":8080", "0.0.0.0:8080") is not a valid place to connect to.
+    if host in ("", "0.0.0.0", "::", "[::]"):
+        host = "127.0.0.1"
+    return f"http://{host}:{port}/api"
+
+
+WHATSAPP_API_BASE_URL = _api_base_url()
 
 @dataclass
 class Message:

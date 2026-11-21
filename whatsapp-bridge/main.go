@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -675,10 +677,47 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+const (
+	// defaultBridgeAddr keeps the REST API reachable from this machine only.
+	defaultBridgeAddr = "127.0.0.1:8080"
+	// maxRequestBodyBytes caps the size of any request body accepted by the REST API.
+	maxRequestBodyBytes = 1 << 20 // 1 MB
+)
+
+// bridgeAddr returns the address the REST API listens on. It defaults to the
+// loopback interface and can be overridden with WHATSAPP_BRIDGE_ADDR.
+func bridgeAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_ADDR")); addr != "" {
+		return addr
+	}
+	return defaultBridgeAddr
+}
+
+// limitRequestBody wraps next so that request bodies larger than
+// maxRequestBodyBytes fail to be read.
+func limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// writeBodyError answers a request whose JSON body could not be decoded.
+func writeBodyError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "Invalid request format", http.StatusBadRequest)
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, addr string) {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -688,7 +727,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Parse the request body
 		var req SendMessageRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			writeBodyError(w, err)
 			return
 		}
 
@@ -724,7 +763,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -734,7 +773,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Parse the request body
 		var req DownloadMediaRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			writeBodyError(w, err)
 			return
 		}
 
@@ -774,13 +813,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           limitRequestBody(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Sending media uploads the file to WhatsApp before replying, so allow more time.
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Bind synchronously so a bad address or a busy port is reported right away.
+	fmt.Printf("Starting REST API server on %s...\n", addr)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("REST API server error: %v\n", err)
+		return
+	}
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -906,7 +959,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, bridgeAddr())
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
