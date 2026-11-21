@@ -22,6 +22,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
@@ -452,6 +454,70 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// maxFilenameBytes caps the length of a stored media file name.
+const maxFilenameBytes = 200
+
+// sanitizeFilename turns a file name chosen by a message's sender into one that
+// is safe to create inside a directory we control. It keeps only the last path
+// element, drops control characters and the separators / \ and :, falls back to
+// document_<timestamp> for empty, "." and ".." names, and limits the result to
+// maxFilenameBytes while preserving the extension.
+func sanitizeFilename(name string) string {
+	name = filepath.Base(strings.ToValidUTF8(name, ""))
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == '/' || r == '\\' || r == ':' {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+
+	if name == "" || name == "." || name == ".." {
+		return "document_" + time.Now().Format("20060102_150405")
+	}
+	return truncateFilename(name, maxFilenameBytes)
+}
+
+// truncateFilename shortens name to at most max bytes, keeping its extension and
+// never cutting a UTF-8 character in half.
+func truncateFilename(name string, max int) string {
+	if len(name) <= max {
+		return name
+	}
+	ext := filepath.Ext(name)
+	if len(ext) > max/2 {
+		// Not a real extension; just cut the name.
+		ext = ""
+	}
+	stem := name[:len(name)-len(ext)]
+	limit := max - len(ext)
+	for limit > 0 && !utf8.RuneStart(stem[limit]) {
+		limit--
+	}
+	return stem[:limit] + ext
+}
+
+// sanitizeChatDirName turns a chat JID into a directory name made only of
+// [A-Za-z0-9@._-]; every other character becomes "_".
+func sanitizeChatDirName(chatJID string) string {
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '@', r == '.', r == '_', r == '-':
+			return r
+		}
+		return '_'
+	}, chatJID)
+	if len(name) > maxFilenameBytes {
+		name = name[:maxFilenameBytes] // ASCII only at this point
+	}
+	// Empty, "." and ".." (or nothing but dots) must never name a directory.
+	if strings.Trim(name, ".") == "" {
+		return "_"
+	}
+	return name
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -478,10 +544,8 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
-		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
-		}
+		// The file name is chosen by the sender, so never store it as received.
+		filename := sanitizeFilename(doc.GetFileName())
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
@@ -642,10 +706,6 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
-	localPath := ""
-
 	// Get media info from the database
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
 
@@ -666,24 +726,30 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
-	}
-
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
-
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
+	// Build the destination from sanitized parts. The stored file name is
+	// sanitized again here to protect rows saved before sanitization existed.
+	storeAbs, err := filepath.Abs(storeDir)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	chatDir := filepath.Join(storeAbs, sanitizeChatDirName(chatJID))
+	filename = sanitizeFilename(filename)
+	localPath := filepath.Join(chatDir, filename)
+
+	// Whatever happened above, never write outside store/
+	if !isWithinDir(storeAbs, localPath) {
+		return false, "", "", "", fmt.Errorf("refusing to write media outside the store directory")
+	}
+
+	// Create directory for the chat if it doesn't exist
+	if err := os.MkdirAll(chatDir, 0700); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
 		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+		return true, mediaType, filename, localPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -728,12 +794,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, localPath, len(mediaData))
+	return true, mediaType, filename, localPath, nil
 }
 
 // Extract direct path from a WhatsApp media URL
