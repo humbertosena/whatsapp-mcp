@@ -4,3 +4,6 @@ whatsapp.log
 
 # Bridge data: session keys, API token, message history and downloaded media
 whatsapp-bridge/store/
+
+# Compiled bridge binary (built locally with go build)
+whatsapp-bridge/whatsapp-bridge
